@@ -1,0 +1,451 @@
+# =============================================================================
+# Data Science with Python for Cybersecurity — Week 6 Final Project
+# Build Your SIEM-Style Detection Pipeline
+# =============================================================================
+# This script runs all six stages of a SIEM-style firewall detection pipeline:
+#   Stage 1: Ingest      — Load the CSV and document data quality issues
+#   Stage 2: Clean       — Fix all 6 known data quality problems
+#   Stage 3: Profile     — Build a per-IP behavioral profile
+#   Stage 4: Rule-Based  — Flag anomalies using z-score and IQR fences
+#   Stage 5: ML          — Score every IP with a Random Forest classifier
+#   Stage 6: Alert       — Unified console output with priority ranking
+# =============================================================================
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from scipy import stats
+from sklearn.ensemble import RandomForestClassifier
+
+
+plt.style.use("dark_background")
+# ── STAGE 1: INGEST ─────────────────────────────────────────────────────────
+# Goal: Load the raw CSV and get a clear picture of what we're working with
+# before touching anything. Document every data quality problem we can see.
+
+print("=" * 65)
+print("STAGE 1 — INGEST")
+print("=" * 65)
+
+# Load the raw firewall log — no cleaning yet, just read it as-is
+df = pd.read_csv("week4_firewall_log.csv")
+
+# Basic shape check — how many rows and columns did we load?
+print(f"\nShape: {df.shape[0]} rows × {df.shape[1]} columns")
+
+# Print column names so we can confirm everything loaded correctly
+print(f"\nColumns: {list(df.columns)}")
+
+# Check data types — this will help us spot columns stored as the wrong type
+print("\nData types:")
+print(df.dtypes)
+
+# Count nulls per column — we know ~6% of 'country' is missing
+print("\nNull counts per column:")
+print(df.isnull().sum())
+
+# Count exact duplicate rows — we know there are 20
+print(f"\nDuplicate rows: {df.duplicated().sum()}")
+
+# ── Known Data Quality Problems (documented before cleaning) ──────────────
+# Problem 1: Mixed timestamp formats — some rows use ISO (2024-03-01 08:00:00)
+#            and others use US slash format (03/01/2024 08:00:00).
+#            pd.to_datetime() needs infer_datetime_format or manual unification.
+#
+# Problem 2: bytes_sent is stored as a string with a 'KB' suffix on some rows
+#            (e.g., "512KB" instead of 512). Must strip the suffix and cast to int.
+#
+# Problem 3: severity has inconsistent casing — values like 'low', 'Low',
+#            'MEDIUM' all mean the same thing. Must normalize to lowercase.
+#
+# Problem 4: country has ~6% null values. We'll fill these with 'Unknown'
+#            rather than dropping rows so we keep all events for analysis.
+#
+# Problem 5: 20 exact duplicate rows are present. They must be removed before
+#            profiling so events aren't counted twice.
+#
+# Problem 6: dst_port is stored as object (string), not integer. Any port-based
+#            math or filtering (e.g., port == 22) will silently fail if not fixed.
+
+print("\nData quality problems documented — see comment block above.")
+
+
+# ── STAGE 2: CLEAN ──────────────────────────────────────────────────────────
+# Fix every one of the 6 documented problems in order.
+# Print row count before and after to confirm duplicate removal worked.
+
+print("\n" + "=" * 65)
+print("STAGE 2 — CLEAN")
+print("=" * 65)
+
+row_count_before = len(df)
+print(f"\nRow count BEFORE cleaning: {row_count_before}")
+
+# ── Fix 1: Unify mixed timestamp formats ─────────────────────────────────
+# pd.to_datetime with infer_datetime_format handles both ISO and US slash
+df["timestamp"] = pd.to_datetime(df["timestamp"], format="mixed")
+
+# ── Fix 2: Strip 'KB' suffix from bytes_sent and cast to numeric ──────────
+# .str.replace() removes the suffix; pd.to_numeric handles any leftovers safely
+df["bytes_sent"] = pd.to_numeric(
+    df["bytes_sent"].astype(str).str.replace("KB", "", case=False).str.strip(),
+    errors="coerce"
+)
+
+# ── Fix 3: Normalize severity casing to lowercase ─────────────────────────
+# .str.lower() on the whole column handles every variant (LOW, Low, low, MEDIUM…)
+df["severity"] = df["severity"].str.lower().str.strip()
+
+# ── Fix 4: Fill null country values with 'Unknown' ───────────────────────
+# We fill rather than drop so every event stays in the dataset
+df["country"] = df["country"].fillna("Unknown")
+
+# ── Fix 5: Remove exact duplicate rows ───────────────────────────────────
+# keep='first' retains the first occurrence of each duplicate set
+df = df.drop_duplicates()
+
+# ── Fix 6: Cast dst_port to integer ──────────────────────────────────────
+# After removing dupes we can safely cast — coerce handles any stray bad values
+df["dst_port"] = pd.to_numeric(df["dst_port"], errors="coerce").astype("Int64")
+
+# ── Add hour column (used in Stage 3 for off-hours profiling) ────────────
+# Hour is extracted from the now-clean timestamp column
+df["hour"] = df["timestamp"].dt.hour
+
+row_count_after = len(df)
+print(f"Row count AFTER  cleaning: {row_count_after}")
+print(f"Rows removed (duplicates): {row_count_before - row_count_after}")
+
+# Verify the fixes took effect — bytes_sent and dst_port should be numeric,
+# severity values should all be lowercase
+print("\nDtypes after cleaning:")
+print(df[["timestamp", "bytes_sent", "severity", "dst_port"]].dtypes)
+print("\nUnique severity values (should all be lowercase):")
+print(df["severity"].unique())
+
+
+# ── STAGE 3: PROFILE ────────────────────────────────────────────────────────
+# Build one row per source IP that summarizes its behavior across all 30 days.
+# Every column here becomes a feature for Stage 4 (rules) and Stage 5 (ML).
+
+print("\n" + "=" * 65)
+print("STAGE 3 — BUILD IP PROFILE")
+print("=" * 65)
+
+# ── Core aggregations ─────────────────────────────────────────────────────
+ip = df.groupby("src_ip").agg(
+    total_events=("src_ip",    "count"),          # total events per IP
+    deny_count=("action", lambda x: (x == "DENY").sum()),   # DENY events
+    unique_ports=("dst_port",  "nunique"),         # distinct destination ports
+    # total bytes across sessions
+    total_bytes=("bytes_sent", "sum"),
+    avg_bytes=("bytes_sent", "mean"),            # average bytes per session
+    # outside 8am–6pm
+    off_hours=("hour", lambda x: ((x < 8) | (x > 18)).sum()),
+).reset_index()
+
+# ── Derived rate columns ──────────────────────────────────────────────────
+# deny_rate: percentage of all events that were denied
+ip["deny_rate"] = (ip["deny_count"] / ip["total_events"] * 100).round(1)
+
+# off_hours_pct: percentage of events that happened outside business hours
+ip["off_hours_pct"] = (ip["off_hours"] / ip["total_events"] * 100).round(1)
+
+# ── Port 22 percentage (SSH traffic indicator) ────────────────────────────
+# Computed separately because it needs a filter before the groupby
+port22 = (
+    df[df["dst_port"] == 22]
+    .groupby("src_ip")
+    .size()
+    .reset_index(name="port22_count")
+)
+
+# Merge port22 counts into the profile; IPs with no port-22 traffic get 0
+ip = ip.merge(port22, on="src_ip", how="left")
+ip["port22_count"] = ip["port22_count"].fillna(0)
+ip["port_22_pct"] = (ip["port22_count"] / ip["total_events"] * 100).round(1)
+
+# Round avg_bytes for readability
+ip["avg_bytes"] = ip["avg_bytes"].round(1)
+
+print(f"\nIP profile shape: {ip.shape}")
+print("\nFirst 8 rows — key columns:")
+key_cols = ["src_ip", "total_events", "deny_count", "deny_rate",
+            "unique_ports", "total_bytes", "avg_bytes", "off_hours_pct", "port_22_pct"]
+print(ip[key_cols].head(8).to_string(index=False))
+
+
+# ── STAGE 4: RULE-BASED DETECTION ───────────────────────────────────────────
+# Two complementary statistical methods flag suspicious IPs:
+#   (a) Z-score on deny_count — catches IPs far above the mean
+#   (b) IQR upper fence on deny_count AND total_bytes — catches high-end outliers
+# An IP is flagged if EITHER method triggers.
+
+print("\n" + "=" * 65)
+print("STAGE 4 — RULE-BASED DETECTION")
+print("=" * 65)
+
+# ── Z-score method ────────────────────────────────────────────────────────
+# z > 2.5 means the IP's deny_count is 2.5 standard deviations above the mean
+ip["deny_zscore"] = stats.zscore(ip["deny_count"])
+ip["alert_z"] = ip["deny_zscore"] > 2.5
+
+# ── IQR fence method ──────────────────────────────────────────────────────
+# Upper fence = Q3 + 1.5 × IQR — the standard boxplot outlier boundary
+q1_deny, q3_deny = ip["deny_count"].quantile([0.25, 0.75])
+iqr_deny = q3_deny - q1_deny
+fence_deny = q3_deny + 1.5 * iqr_deny          # deny_count upper fence
+
+q1_bytes, q3_bytes = ip["total_bytes"].quantile([0.25, 0.75])
+iqr_bytes = q3_bytes - q1_bytes
+fence_bytes = q3_bytes + 1.5 * iqr_bytes        # total_bytes upper fence
+
+# An IP triggers alert_iqr if it exceeds EITHER fence
+ip["alert_iqr"] = (ip["deny_count"] > fence_deny) | (
+    ip["total_bytes"] > fence_bytes)
+
+# Combined rule alert — flagged by z-score OR IQR
+ip["rule_alert"] = ip["alert_z"] | ip["alert_iqr"]
+
+# Print threshold values so results are reproducible and auditable
+print(f"\nZ-score threshold     : 2.5")
+print(f"IQR fence (deny_count): {fence_deny:.1f}")
+print(f"IQR fence (total_bytes): {fence_bytes:.1f}")
+print(f"\nIPs flagged by rule-based detection: {ip['rule_alert'].sum()}")
+
+print("\nFlagged IPs:")
+flagged_cols = ["src_ip", "deny_count", "deny_zscore",
+                "total_bytes", "alert_z", "alert_iqr", "rule_alert"]
+print(ip[ip["rule_alert"]][flagged_cols].to_string(index=False))
+
+
+# ── STAGE 5: ML CLASSIFICATION ──────────────────────────────────────────────
+# Train a Random Forest using rule_alert as the label.
+# The model then produces a continuous risk_score (0–1) for every IP,
+# which can catch risky IPs that the hard-threshold rules missed.
+
+print("\n" + "=" * 65)
+print("STAGE 5 — ML CLASSIFICATION")
+print("=" * 65)
+
+# Exact feature list required by the project spec
+FEATURES = [
+    "deny_rate",
+    "unique_ports",
+    "total_bytes",
+    "avg_bytes",
+    "off_hours_pct",
+    "port_22_pct",
+    "deny_count",
+]
+
+# Use rule_alert as the binary training label (1 = high-risk, 0 = normal)
+ip["high_risk"] = ip["rule_alert"].astype(int)
+
+X = ip[FEATURES]
+y = ip["high_risk"]
+
+# Train the Random Forest — random_state=42 makes results reproducible
+rf = RandomForestClassifier(n_estimators=100, random_state=42)
+rf.fit(X, y)
+
+# predict_proba returns [P(class=0), P(class=1)] — we want the second column
+ip["risk_score"] = rf.predict_proba(X)[:, 1].round(3)
+
+# ── Feature importance summary ────────────────────────────────────────────
+importances = pd.Series(rf.feature_importances_,
+                        index=FEATURES).sort_values(ascending=False)
+print("\nTop 3 feature importances:")
+for feat, imp in importances.head(3).items():
+    print(f"  {feat:<18} {imp:.3f}  ({imp*100:.1f}%)")
+
+# Print the full IP profile sorted by risk_score so highest-risk IPs are first
+print("\nFull IP profile sorted by risk_score (descending):")
+sorted_cols = ["src_ip", "deny_rate", "off_hours_pct", "unique_ports",
+               "total_bytes", "risk_score", "rule_alert"]
+print(ip.sort_values("risk_score", ascending=False)
+      [sorted_cols].to_string(index=False))
+
+
+# ── STAGE 6: UNIFIED ALERT CONSOLE ──────────────────────────────────────────
+# Combine rule_alert and risk_score into a single priority score.
+# Priority blends rule-based confidence (50%) and ML confidence (50%).
+# Final output mimics what a SOC analyst would see on a live dashboard.
+
+print("\n" + "=" * 65)
+print("STAGE 6 — UNIFIED ALERT CONSOLE")
+print("=" * 65)
+
+# Priority formula: equal weight between rule flag and ML score
+ip["priority"] = (ip["rule_alert"].astype(
+    int) * 0.5 + ip["risk_score"] * 0.5).round(3)
+
+# Sort by priority descending — highest risk at the top
+ip_sorted = ip.sort_values("priority", ascending=False)
+
+# ── Console header ────────────────────────────────────────────────────────
+total_ips = len(ip)
+rule_flags = ip["rule_alert"].sum()
+max_ml = ip["risk_score"].max()
+
+print(f"\n{'='*65}")
+print(f"  SIEM ALERT CONSOLE")
+print(f"  Total IPs analyzed : {total_ips}")
+print(f"  Rule-based flags   : {rule_flags}")
+print(f"  Max ML risk score  : {max_ml}")
+print(f"{'='*65}")
+
+# ── Full sorted alert table ───────────────────────────────────────────────
+console_cols = ["src_ip", "deny_rate", "off_hours_pct", "unique_ports",
+                "risk_score", "rule_alert", "priority"]
+print("\nFull alert table (sorted by priority):")
+print(ip_sorted[console_cols].to_string(index=False))
+
+# ── High-priority summary — IPs with priority > 0.4 ──────────────────────
+# Label each IP as [RULE+ML] if the rule also fired, or [ML ONLY] if not
+high_priority = ip_sorted[ip_sorted["priority"] > 0.4].copy()
+high_priority["alert_type"] = high_priority["rule_alert"].apply(
+    lambda x: "[RULE+ML]" if x else "[ML ONLY]"
+)
+
+print(f"\n{'─'*65}")
+print(f"  HIGH-PRIORITY ALERTS  (priority > 0.4)")
+print(f"{'─'*65}")
+for _, row in high_priority.iterrows():
+    print(f"  {row['alert_type']:<12}  {row['src_ip']:<15}  "
+          f"priority={row['priority']:.3f}   risk_score={row['risk_score']:.3f}")
+print(f"{'─'*65}\n")
+
+
+# ── CHARTS ───────────────────────────────────────────────────────────────────
+# All three charts are saved as PNG before plt.show() so they are always
+# written to disk even if the environment doesn't display an interactive window.
+
+# ── Chart 1: Alert Risk Map ───────────────────────────────────────────────
+# Scatter of total_events vs deny_count with three color tiers:
+#   Teal  = normal IP (risk_score < 0.5 AND no rule alert)
+#   Amber = ML-only flag (risk_score >= 0.5, no rule alert)
+#   Red   = rule + ML flag (rule_alert == True)
+
+fig1, ax1 = plt.subplots(figsize=(10, 6))
+
+# Classify each IP into one of three visual tiers
+
+
+def get_color(row):
+    if row["rule_alert"]:
+        return "red"
+    elif row["risk_score"] >= 0.5:
+        return "orange"
+    else:
+        return "teal"
+
+
+colors = ip.apply(get_color, axis=1)
+
+ax1.scatter(ip["total_events"], ip["deny_count"],
+            c=colors, alpha=0.7, s=60, edgecolors="white")
+
+# Annotate red (rule+ML) dots with the IP address
+for _, row in ip[ip["rule_alert"]].iterrows():
+    ax1.annotate(row["src_ip"], (row["total_events"], row["deny_count"]),
+                 textcoords="offset points", xytext=(6, 4), fontsize=7)
+
+# Horizontal threshold line at the IQR deny fence
+ax1.axhline(y=fence_deny, color="gray", linestyle="--",
+            linewidth=1, label=f"IQR Fence ({fence_deny:.1f})")
+
+# Legend patches
+legend_patches = [
+    mpatches.Patch(color="teal",   label="Normal"),
+    mpatches.Patch(color="orange", label="ML-only flag"),
+    mpatches.Patch(color="red",    label="Rule + ML flag"),
+]
+ax1.legend(handles=legend_patches + [plt.Line2D(
+    [0], [0], color="gray", linestyle="--", label=f"IQR Fence ({fence_deny:.1f})")])
+
+ax1.set_title("Alert Risk Map — Events vs DENY Count")
+ax1.set_xlabel("Total Events")
+ax1.set_ylabel("DENY Count")
+plt.tight_layout()
+plt.savefig("chart1_alert_map.png", dpi=150)
+plt.show()
+print("Saved: chart1_alert_map.png")
+
+# ── Chart 2: Feature Importance ───────────────────────────────────────────
+# Horizontal bar chart sorted ascending so the most important feature
+# appears at the top when read naturally top-to-bottom.
+
+fig2, ax2 = plt.subplots(figsize=(8, 5))
+
+# Sort ascending so longest bar is at the top of the chart
+imp_sorted = importances.sort_values(ascending=True)
+bar_colors = ["red" if v > 0.15 else "teal" for v in imp_sorted.values]
+
+bars = ax2.barh(imp_sorted.index, imp_sorted.values,
+                color=bar_colors, edgecolor="white")
+
+# Label each bar with its percentage value
+for bar, val in zip(bars, imp_sorted.values):
+    ax2.text(val + 0.002, bar.get_y() + bar.get_height() / 2,
+             f"{val*100:.1f}%", va="center", fontsize=9)
+
+ax2.set_title("Random Forest Feature Importances")
+ax2.set_xlabel("Importance")
+ax2.set_xlim(0, imp_sorted.values.max() + 0.06)
+
+legend_patches2 = [
+    mpatches.Patch(color="red",  label="> 15% importance"),
+    mpatches.Patch(color="teal", label="≤ 15% importance"),
+]
+ax2.legend(handles=legend_patches2)
+plt.tight_layout()
+plt.savefig("chart2_feature_importance.png", dpi=150)
+plt.show()
+print("Saved: chart2_feature_importance.png")
+
+# ── Chart 3: Hourly DENY Pattern with Anomaly Hours Highlighted ───────────
+# Shows when DENY events cluster throughout the day.
+# Anomalous hours (defined as above the IQR upper fence for hourly denies)
+# are highlighted in red — useful for spotting off-hours attack windows.
+
+# Count DENY events per hour across all IPs
+deny_by_hour = (
+    df[df["action"] == "DENY"]
+    .groupby("hour")
+    .size()
+    .reindex(range(24), fill_value=0)
+)
+
+# IQR fence to identify anomalous hours
+q1_h, q3_h = deny_by_hour.quantile([0.25, 0.75])
+iqr_h = q3_h - q1_h
+fence_hour = q3_h + 1.5 * iqr_h
+
+hour_colors = ["red" if v >
+               fence_hour else "steelblue" for v in deny_by_hour.values]
+
+fig3, ax3 = plt.subplots(figsize=(12, 5))
+ax3.bar(deny_by_hour.index, deny_by_hour.values,
+        color=hour_colors, edgecolor="white")
+ax3.axhline(y=fence_hour, color="gray", linestyle="--", linewidth=1,
+            label=f"IQR Anomaly Threshold ({fence_hour:.0f})")
+
+ax3.set_title("Hourly DENY Event Count — Anomalous Hours Highlighted")
+ax3.set_xlabel("Hour of Day (0 = midnight)")
+ax3.set_ylabel("DENY Event Count")
+ax3.set_xticks(range(24))
+
+legend_patches3 = [
+    mpatches.Patch(color="red",       label="Anomalous hour"),
+    mpatches.Patch(color="steelblue", label="Normal hour"),
+]
+ax3.legend(handles=legend_patches3 + [plt.Line2D(
+    [0], [0], color="gray", linestyle="--", label=f"Threshold ({fence_hour:.0f})")])
+plt.tight_layout()
+plt.savefig("chart3_hourly_deny_pattern.png", dpi=150)
+plt.show()
+print("Saved: chart3_hourly_deny_pattern.png")
+
+print("\nPipeline complete. All 6 stages finished successfully.")
